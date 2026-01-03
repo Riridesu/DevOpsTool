@@ -1,0 +1,5 @@
+{
+    "entry_point": "DevOpsTool.py",
+    "output_name": "DevOpsTool",
+    "git_repo": "DevOpsTool"
+}

@@ -1,3 +1,4 @@
+# DevOpsTool.py
 import customtkinter as ctk
 import os
 import subprocess
@@ -10,6 +11,8 @@ import requests  # 需 pip install requests
 from packaging import version  # 需 pip install packaging
 from tkinter import filedialog, messagebox
 import signal
+import tempfile
+import traceback
 
 # ================= 設定區 (開發者請修改這裡) =================
 APP_NAME = "DevOpsMaster"
@@ -31,7 +34,8 @@ ctk.set_default_color_theme("dark-blue")
 
 # --- 設定檔路徑遷移至 AppData ---
 if os.name == 'nt':
-    APP_DATA_DIR = os.path.join(os.getenv('APPDATA'), APP_NAME)
+    appdata_env = os.getenv('APPDATA') or os.path.expanduser('~')
+    APP_DATA_DIR = os.path.join(appdata_env, APP_NAME)
 else:
     APP_DATA_DIR = os.path.join(os.path.expanduser('~'), ".config", APP_NAME)
 
@@ -50,7 +54,7 @@ if os.path.exists(local_config) and not os.path.exists(GLOBAL_CONFIG_FILE):
 
 
 class UpdateManager:
-    """處理線上更新的核心邏輯"""
+    """處理線上更新的核心邏輯（UI 互動皆會派回主執行緒）"""
     def __init__(self, app_instance, log_callback):
         self.app = app_instance
         self.log = log_callback
@@ -63,79 +67,145 @@ class UpdateManager:
             pass
 
     def check_for_updates(self):
-        self.log(f"正在檢查更新... (目前版本 v{CURRENT_VERSION})")
+        """在背景執行緒下載遠端版本號，後續的 UI 互動使用 app.after 跑到主執行緒"""
         try:
-            response = self.session.get(VERSION_URL, timeout=5)
+            self.log(f"正在檢查更新... (目前版本 v{CURRENT_VERSION})")
+            response = self.session.get(VERSION_URL, timeout=8)
             if response.status_code != 200:
                 self.log(f"檢查失敗: 無法連接伺服器 (Code {response.status_code})")
+                # show message on main thread
+                self.app.after(0, lambda: messagebox.showwarning("檢查失敗", f"無法連接更新伺服器 (Code {response.status_code})"))
                 return
 
             remote_ver_str = response.text.strip()
             self.log(f"遠端版本: v{remote_ver_str}")
 
-            if version.parse(remote_ver_str) > version.parse(CURRENT_VERSION):
-                ans = messagebox.askyesno("發現新版本", f"發現新版本 v{remote_ver_str}！\n\n點擊「是」將自動下載並重啟更新。")
-                if ans:
-                    self.perform_update()
-            else:
-                self.log("目前已是最新版本。")
-                messagebox.showinfo("檢查結果", "目前已是最新版本。")
+            try:
+                if version.parse(remote_ver_str) > version.parse(CURRENT_VERSION):
+                    # prompt on main thread, then if yes start download in background
+                    def prompt_and_update():
+                        ans = messagebox.askyesno("發現新版本", f"發現新版本 v{remote_ver_str}！\n\n點擊「是」將自動下載並重啟更新。")
+                        if ans:
+                            # run perform_update in a background daemon thread to avoid blocking UI
+                            th = threading.Thread(target=self.perform_update, daemon=True)
+                            th.start()
+
+                    self.app.after(0, prompt_and_update)
+                else:
+                    self.log("目前已是最新版本。")
+                    self.app.after(0, lambda: messagebox.showinfo("檢查結果", "目前已是最新版本。"))
+            except Exception as e:
+                self.log(f"版本比對失敗: {e}\n{traceback.format_exc()}")
 
         except Exception as e:
-            self.log(f"更新檢查發生錯誤: {e}")
+            self.log(f"更新檢查發生錯誤: {e}\n{traceback.format_exc()}")
+            self.app.after(0, lambda: messagebox.showerror("檢查錯誤", str(e)))
 
     def perform_update(self):
+        """下載新 exe 並啟動更新流程（下載於 APP_DATA_DIR，UI 訊息回到主執行緒）"""
         self.log("開始下載更新檔...")
-        temp_exe = "update_temp.exe"
+        # 下載到 AppData 的暫存檔
         try:
-            with self.session.get(EXE_DOWNLOAD_URL, stream=True, timeout=30) as r:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".exe", prefix="update_", dir=APP_DATA_DIR)
+            os.close(tmp_fd)
+            self.log(f"暫存檔: {tmp_path}")
+
+            with self.session.get(EXE_DOWNLOAD_URL, stream=True, timeout=60) as r:
                 r.raise_for_status()
-                with open(temp_exe, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
+                with open(tmp_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=16384):
                         if chunk:
                             f.write(chunk)
 
             self.log("下載完成，準備重新啟動...")
-            current_exe = sys.executable
 
-            if not current_exe.endswith(".exe") or "python" in os.path.basename(current_exe).lower():
-                messagebox.showwarning("無法更新", "您正在使用 Python 直譯器執行腳本，\n無法進行 EXE 自我覆蓋測試。")
+            current_exe = sys.executable
+            basename = os.path.basename(current_exe).lower()
+
+            # 如果是在 python 解譯器中執行（非封裝 exe），不做覆蓋，但通知使用者
+            if not current_exe.lower().endswith(".exe") or "python" in basename:
+                self.log("偵測到非 exe 執行環境，無法自動更新執行檔。")
+                def notify():
+                    messagebox.showwarning("無法更新", "您正在使用 Python 直譯器執行腳本，\n無法進行 EXE 自我覆蓋。請以已封裝的 .exe 執行更新。")
+                self.app.after(0, notify)
                 try:
-                    os.remove(temp_exe)
+                    os.remove(tmp_path)
                 except Exception:
                     pass
                 return
 
-            bat_script = f"""
-@echo off
+            # 建立 updater.bat 放在 APP_DATA_DIR，使用絕對路徑並嘗試替換 exe（會等待原程序關閉）
+            bat_path = os.path.join(APP_DATA_DIR, "updater.bat")
+            # 使用延遲/重試以處理 windows 鎖定問題
+            bat_script = f"""@echo off
 title Updating {APP_NAME}...
-timeout /t 2 /nobreak > NUL
-del "{current_exe}"
-move "{temp_exe}" "{current_exe}"
+REM 等待原程序完全關閉並嘗試替換 (最多 30 次)
+setlocal enabledelayedexpansion
+set RETRIES=0
+:LOOP
+if %RETRIES% GEQ 30 goto FAIL
+timeout /t 1 /nobreak > NUL
+2>nul attrib -r "{current_exe}"
+move /Y "{tmp_path}" "{current_exe}" >nul 2>&1
+if exist "{current_exe}" (
+    goto STARTAPP
+) else (
+    set /a RETRIES+=1
+    goto LOOP
+)
+:STARTAPP
 start "" "{current_exe}"
 del "%~f0"
+exit /b 0
+:FAIL
+echo 更新失敗，請手動替換 {current_exe}
+pause
+del "%~f0"
 """
-            with open("updater.bat", "w", encoding='utf-8') as bat:
-                bat.write(bat_script)
-
-            subprocess.Popen("updater.bat", shell=True)
             try:
-                self.app.on_closing(force=True)
-            except Exception:
+                with open(bat_path, "w", encoding='utf-8') as bat:
+                    bat.write(bat_script)
+            except Exception as e:
+                self.log(f"寫入 updater.bat 失敗: {e}\n{traceback.format_exc()}")
                 try:
-                    self.app.destroy()
+                    os.remove(tmp_path)
                 except Exception:
                     pass
-            sys.exit(0)
+                self.app.after(0, lambda: messagebox.showerror("更新錯誤", f"無法建立 updater.bat：{e}"))
+                return
+
+            # 啟動 updater.bat
+            try:
+                # 啟動後主程序需結束，讓批次檔能替換檔案
+                subprocess.Popen(f'"{bat_path}"', shell=True, cwd=APP_DATA_DIR)
+                # 關閉應用程式（在主執行緒呼叫 on_closing）
+                try:
+                    self.app.after(0, lambda: self.app.on_closing(force=True))
+                except Exception:
+                    pass
+                # 強制退出背景執行緒/進程
+                try:
+                    time.sleep(1)
+                except Exception:
+                    pass
+                os._exit(0)
+            except Exception as e:
+                self.log(f"啟動 updater.bat 失敗: {e}\n{traceback.format_exc()}")
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                self.app.after(0, lambda: messagebox.showerror("更新錯誤", str(e)))
 
         except Exception as e:
-            self.log(f"更新失敗: {e}")
+            self.log(f"更新失敗: {e}\n{traceback.format_exc()}")
             try:
-                if os.path.exists(temp_exe):
-                    os.remove(temp_exe)
+                if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
             except Exception:
                 pass
-            messagebox.showerror("更新錯誤", str(e))
+            self.app.after(0, lambda: messagebox.showerror("更新錯誤", str(e)))
 
 
 class TaskHandler:
@@ -156,10 +226,15 @@ class TaskHandler:
         try:
             if os.name == 'nt':
                 try:
+                    # 需要 process 是 new process group 才能生效
                     process.send_signal(signal.CTRL_BREAK_EVENT)
                     self.log("已向 Windows process group 發送 CTRL_BREAK_EVENT。")
                 except Exception as e:
                     self.log(f"發送 CTRL_BREAK_EVENT 失敗: {e}")
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
             else:
                 try:
                     pgid = os.getpgid(process.pid)
@@ -202,16 +277,27 @@ class TaskHandler:
                 self.stop_event.clear()
 
             try:
-                for line in iter(process.stdout.readline, ''):
-                    if line:
-                        self.log(line.rstrip())
-                    if self.stop_event.is_set():
-                        try:
-                            self._terminate_process_group(process)
-                        except Exception:
-                            pass
+                # 防護：process.stdout 可能為 None
+                if process.stdout is not None:
+                    for line in iter(process.stdout.readline, ''):
+                        if line:
+                            self.log(line.rstrip())
+                        # 檢查中斷事件
+                        if self.stop_event.is_set():
+                            try:
+                                self._terminate_process_group(process)
+                            except Exception:
+                                pass
+                            # 繼續讀取輸出直到 process 結束或被 kill
+                    # close stdout if still open
+                    try:
+                        process.stdout.close()
+                    except Exception:
+                        pass
+                else:
+                    self.log("process.stdout is None")
             except Exception as e:
-                self.log(f"讀取 subprocess 輸出錯誤: {e}")
+                self.log(f"讀取 subprocess 輸出錯誤: {e}\n{traceback.format_exc()}")
                 try:
                     if process.poll() is None:
                         process.terminate()
@@ -238,7 +324,7 @@ class TaskHandler:
 
             return rc
         except Exception as e:
-            self.log(f"指令錯誤: {e}")
+            self.log(f"指令錯誤: {e}\n{traceback.format_exc()}")
             return 1
         finally:
             with self.process_lock:
@@ -300,13 +386,19 @@ class TaskHandler:
 
     def action_run(self, project_path, entry_point):
         self.log(f"--- 執行測試: {entry_point} ---")
-        self.run_cmd(f'python "{entry_point}"', cwd=project_path)
+        ep = os.path.join(project_path, entry_point) if not os.path.isabs(entry_point) else entry_point
+        if not os.path.exists(ep):
+            self.log(f"入口檔案不存在: {ep}")
+            self.app_log_local(f"入口檔案不存在: {ep}")
+            return
+        self.run_cmd(f'python "{ep}"', cwd=project_path)
 
     def action_build(self, project_path, venv_name, entry_point, output_name):
         self.log("--- 開始建置流程 ---")
         venv_path = os.path.join(project_path, venv_name)
         if not os.path.exists(venv_path):
             self.log("建立虛擬環境...")
+            # 建立於 project_path
             self.run_cmd(f'python -m venv "{venv_name}"', cwd=project_path)
 
         pip_cmd = os.path.join(venv_path, "Scripts", "pip.exe") if os.name == 'nt' else os.path.join(venv_path, "bin", "pip")
@@ -322,8 +414,21 @@ class TaskHandler:
             except Exception as e:
                 self.log(f"讀取 requirements.txt 發生錯誤: {e}")
 
-        self.run_cmd(f'"{pip_cmd}" install {" ".join(pkgs)}', cwd=project_path)
-        cmd = f'"{py_cmd}" -m PyInstaller -F --clean --name "{output_name}" "{entry_point}" --distpath ./dist'
+        # 如果 pip 不存在，改用 python -m pip 安裝
+        if not os.path.exists(pip_cmd):
+            self.log("venv pip 未找到，使用 python -m pip 安裝套件。")
+            install_cmd = f'"{py_cmd}" -m pip install {" ".join(pkgs)}'
+        else:
+            install_cmd = f'"{pip_cmd}" install {" ".join(pkgs)}'
+
+        self.run_cmd(install_cmd, cwd=project_path)
+
+        ep = os.path.join(project_path, entry_point) if not os.path.isabs(entry_point) else entry_point
+        if not os.path.exists(ep):
+            self.log(f"入口檔案不存在: {ep}，建置取消。")
+            return
+
+        cmd = f'"{py_cmd}" -m PyInstaller -F --clean --name "{output_name}" "{ep}" --distpath ./dist'
         self.run_cmd(cmd, cwd=project_path)
         self.log(f"打包完成: dist/{output_name}.exe")
 
@@ -339,7 +444,11 @@ class TaskHandler:
 
         self.run_cmd(f"git remote add origin https://github.com/{user}/{repo}.git", cwd=project_path)
         self.run_cmd("git add .", cwd=project_path)
-        self.run_cmd('git commit -m "Update via DevOps Tool"', cwd=project_path)
+        rc = self.run_cmd('git commit -m "Update via DevOps Tool"', cwd=project_path)
+        if rc != 0:
+            # commit 失敗可能是沒有變更，記錄並嘗試 push（如果 remote 已有 commit）
+            self.log("git commit 可能失敗（例如沒有變更或尚未設定 git user），跳過 commit。")
+        # 嘗試推送 main，若失敗再嘗試 master
         if self.run_cmd("git push -u origin main", cwd=project_path) != 0:
             self.run_cmd("git push -u origin master", cwd=project_path)
 
@@ -390,7 +499,10 @@ class App(ctk.CTk):
 
         self.lang = "zh" # 預設語言
 
+        # handler 需要能記錄 UI log（handler 內有些方法會呼叫 app 屬性）
         self.handler = TaskHandler(log_callback=self.ui_log)
+        # 把 app 參考注入 handler（部分 handler 方法想要呼叫 app 的函式）
+        self.handler.app_log_local = self.ui_log
         self.updater = UpdateManager(app_instance=self, log_callback=self.ui_log)
 
         self.project_path = None
@@ -540,6 +652,7 @@ class App(ctk.CTk):
 
     def ui_log(self, msg):
         try:
+            # 使用 after 保證在主執行緒操作 UI
             self.after(0, lambda: (self.textbox.insert("end", str(msg) + "\n"), self.textbox.see("end")))
         except Exception:
             pass
@@ -573,11 +686,13 @@ class App(ctk.CTk):
             "language": self.lang  # 儲存語言設定
         }
         try:
+            # 確保目錄存在
+            os.makedirs(os.path.dirname(GLOBAL_CONFIG_FILE), exist_ok=True)
             with open(GLOBAL_CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
             self.ui_log(f"全域設定已儲存 ({GLOBAL_CONFIG_FILE})")
         except Exception as e:
-            self.ui_log(f"儲存失敗: {e}")
+            self.ui_log(f"儲存失敗: {e}\n{traceback.format_exc()}")
 
     def update_history_menu(self):
         val = self.recent_projects[:10] if self.recent_projects else ["無紀錄"]
@@ -644,7 +759,7 @@ class App(ctk.CTk):
                 json.dump(data, f, indent=4, ensure_ascii=False)
             self.ui_log("專案設定已儲存。")
         except Exception as e:
-            self.ui_log(f"儲存專案設定失敗: {e}")
+            self.ui_log(f"儲存專案設定失敗: {e}\n{traceback.format_exc()}")
 
     # --- 執行緒 ---
     def _run(self, func, *args):
@@ -656,7 +771,7 @@ class App(ctk.CTk):
             try:
                 func(*args)
             except Exception as e:
-                self.ui_log(f"工作執行失敗: {e}")
+                self.ui_log(f"工作執行失敗: {e}\n{traceback.format_exc()}")
             finally:
                 with self._threads_lock:
                     try:
@@ -664,7 +779,7 @@ class App(ctk.CTk):
                     except Exception:
                         pass
 
-        th = threading.Thread(target=wrapper, daemon=False)
+        th = threading.Thread(target=wrapper, daemon=True)
         with self._threads_lock:
             self._threads.append(th)
         th.start()

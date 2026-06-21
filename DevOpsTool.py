@@ -16,11 +16,11 @@ import traceback
 
 # ================= 設定區 (開發者請修改這裡) =================
 APP_NAME = "DevOpsTool"
-CURRENT_VERSION = "1.0.1"  # 更新版本號
+CURRENT_VERSION = "1.1.0"  # 更新版本號
 
 # GitHub 更新資訊
-GITHUB_USER = "Riridesu"     # 你的 GitHub 帳號
-GITHUB_REPO = "DevOpsTool"     # 你的儲存庫名稱
+GITHUB_USER = "USER"     # 你的 GitHub 帳號
+GITHUB_REPO = "REPO"     # 你的儲存庫名稱
 
 # 1. 版本檢查網址
 VERSION_URL = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/main/version.txt"

@@ -15,7 +15,7 @@ import tempfile
 import traceback
 
 # ================= 設定區 (開發者請修改這裡) =================
-APP_NAME = "DevOpsMaster"
+APP_NAME = "DevOpsTool"
 CURRENT_VERSION = "1.0.1"  # 更新版本號
 
 # GitHub 更新資訊
@@ -428,12 +428,25 @@ class TaskHandler:
             self.log(f"入口檔案不存在: {ep}，建置取消。")
             return
 
-        cmd = f'"{py_cmd}" -m PyInstaller -F --clean --name "{output_name}" "{ep}" --distpath ./dist'
+        # ================= 新增防呆機制 =================
+        extra_flags = ""
+        # 檢查套件清單中是否包含 customtkinter
+        if any("customtkinter" in pkg.lower() for pkg in pkgs):
+            self.log("💡 偵測到 customtkinter，自動加入 --collect-all 參數以防資源遺失...")
+            extra_flags += " --collect-all customtkinter"
+            
+        # 若有需要隱藏執行時的黑窗，未來可以在 extra_flags 加入 " -w"
+        # ================================================
+
+        cmd = f'"{py_cmd}" -m PyInstaller -F --clean --name "{output_name}"{extra_flags} "{ep}" --distpath ./dist'
         self.run_cmd(cmd, cwd=project_path)
         self.log(f"打包完成: dist/{output_name}.exe")
 
     def action_publish(self, project_path, user, repo):
-        self.log(f"--- 發布至 GitHub ({user}/{repo}) ---")
+        # 建立安全且正確的 Repo 名稱 (將空白替換為連字號)
+        safe_repo = repo.replace(" ", "-")
+
+        self.log(f"--- 發布至 GitHub ({user}/{safe_repo}) ---")
         if not os.path.exists(os.path.join(project_path, ".git")):
             self.run_cmd("git init", cwd=project_path)
 
@@ -442,7 +455,8 @@ class TaskHandler:
         except Exception:
             pass
 
-        self.run_cmd(f"git remote add origin https://github.com/{user}/{repo}.git", cwd=project_path)
+        # 將 remote URL 替換為沒有空白的 safe_repo
+        self.run_cmd(f"git remote add origin https://github.com/{user}/{safe_repo}.git", cwd=project_path)
         self.run_cmd("git add .", cwd=project_path)
         rc = self.run_cmd('git commit -m "Update via DevOps Tool"', cwd=project_path)
         if rc != 0:
